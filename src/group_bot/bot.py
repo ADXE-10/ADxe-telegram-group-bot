@@ -163,6 +163,13 @@ def _time_part(iso_text: str | None) -> str:
     return iso_text.split("T", 1)[-1][:8]
 
 
+async def _mentions_bot(text: str, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    bot_user = await context.bot.get_me()
+    if not bot_user.username:
+        return False
+    return f"@{bot_user.username.lower()}" in text.lower()
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _remember_user(update)
     if update.message:
@@ -494,6 +501,11 @@ async def plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     text = _clean_text(update.message.text)
     normalized = text.replace("：", ":", 1)
+
+    if text in {"规则", "使用规则", "帮助", "怎么用", "用法"} or await _mentions_bot(text, context):
+        await help_command(update, context)
+        return
+
     done_numbers = _parse_done_numbers(text)
 
     if done_numbers:
