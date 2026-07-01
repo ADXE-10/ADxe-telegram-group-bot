@@ -18,12 +18,12 @@ HELP_TEXT = """常用说法：
 下班 / 下班打卡
 我的任务
 今日记录
-进度 任务ID 进度说明
-完成 任务ID
+进度 1 进度说明
+1完成.2完成
 
 管理员说法：
-回复成员消息：任务 任务内容
-任务 @username 任务内容
+回复成员消息：任务 1. 任务内容 2. 任务内容
+任务 @username 1. 任务内容 2. 任务内容
 今日任务
 今日汇总
 
@@ -75,6 +75,54 @@ def _clean_text(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip())
 
 
+def _split_id_and_note(text: str) -> tuple[int | None, str]:
+    parts = _clean_text(text).split(" ", 1)
+    if not parts or not parts[0].isdigit():
+        return None, ""
+    return int(parts[0]), parts[1].strip() if len(parts) > 1 else ""
+
+
+def _split_numbered_tasks(text: str) -> list[str]:
+    text = _clean_text(text)
+    matches = list(re.finditer(r"(?:^|\s)(\d+)[\.、\)）]\s*", text))
+    if not matches:
+        return [text] if text else []
+
+    tasks: list[str] = []
+    for index, match in enumerate(matches):
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        title = text[start:end].strip(" .。;；,，")
+        if title:
+            tasks.append(title)
+    return tasks
+
+
+def _parse_done_numbers(text: str) -> list[int]:
+    numbers: list[int] = []
+    for match in re.finditer(r"(?<!\d)(\d+)\s*(?:完成|已完成|做完)(?:了)?", text):
+        number = int(match.group(1))
+        if number not in numbers:
+            numbers.append(number)
+    return numbers
+
+
+def _numbered_user_tasks(chat_id: int, user_id: int) -> list:
+    rows = runtime.repo.list_tasks_for_user(chat_id, user_id, runtime.today())
+    return sorted(rows, key=lambda row: int(row["id"]))
+
+
+def _resolve_user_task(chat_id: int, user_id: int, number: int):
+    rows = _numbered_user_tasks(chat_id, user_id)
+    if 1 <= number <= len(rows):
+        return rows[number - 1]
+
+    row = runtime.repo.get_task(chat_id, number)
+    if row and int(row["assignee_user_id"]) == int(user_id):
+        return row
+    return None
+
+
 async def _remember_user(update: Update) -> None:
     chat_id = _chat_id(update)
     user = _user(update)
@@ -113,13 +161,6 @@ def _time_part(iso_text: str | None) -> str:
     if not iso_text:
         return "-"
     return iso_text.split("T", 1)[-1][:8]
-
-
-def _split_id_and_note(text: str) -> tuple[int | None, str]:
-    parts = _clean_text(text).split(" ", 1)
-    if not parts or not parts[0].isdigit():
-        return None, ""
-    return int(parts[0]), parts[1].strip() if len(parts) > 1 else ""
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -193,14 +234,14 @@ async def _create_task(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
 
     assignee_user_id: int | None = None
     assignee_username: str | None = None
-    title = ""
+    task_text = ""
     text = _clean_text(text)
 
     if update.message.reply_to_message and update.message.reply_to_message.from_user:
         assignee = update.message.reply_to_message.from_user
         assignee_user_id = int(assignee.id)
         assignee_username = assignee.username
-        title = text
+        task_text = text
         runtime.repo.upsert_user(
             UserProfile(
                 chat_id=_chat_id(update),
@@ -210,36 +251,47 @@ async def _create_task(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
             ),
             runtime.now(),
         )
+        assignee_name = _display_name(assignee)
     elif text.startswith("@"):
         parts = text.split(" ", 1)
         if len(parts) < 2:
-            await update.message.reply_text("请这样发：任务 @成员 任务内容")
+            await update.message.reply_text("请这样发：任务 @成员 1. 任务内容 2. 任务内容")
             return
         found = runtime.repo.find_user_by_username(_chat_id(update), parts[0])
         if not found:
-            await update.message.reply_text("还不认识这个成员。请让对方先发一次“签到”，或回复他的消息后发“任务 任务内容”。")
+            await update.message.reply_text("还不认识这个成员。请让对方先发一次“签到”，或回复他的消息后发“任务 1. 任务内容”。")
             return
         assignee_user_id = int(found["user_id"])
         assignee_username = found["username"]
-        title = parts[1].strip()
+        task_text = parts[1].strip()
+        assignee_name = found["full_name"] or assignee_username
     else:
-        await update.message.reply_text("请回复某个成员的消息后发送：任务 任务内容")
+        await update.message.reply_text("请回复某个成员的消息后发送：任务 1. 任务内容 2. 任务内容")
         return
 
-    if not title:
+    task_titles = _split_numbered_tasks(task_text)
+    if not task_titles:
         await update.message.reply_text("任务内容不能为空。")
         return
 
-    task_id = runtime.repo.create_task(
-        chat_id=_chat_id(update),
-        assignee_user_id=assignee_user_id,
-        assignee_username=assignee_username,
-        title=title,
-        task_date=runtime.today(),
-        created_by_user_id=int(_user(update).id),
-        now=runtime.now(),
-    )
-    await update.message.reply_text(f"已创建任务 #{task_id}：{title}")
+    created_ids: list[int] = []
+    for title in task_titles:
+        task_id = runtime.repo.create_task(
+            chat_id=_chat_id(update),
+            assignee_user_id=assignee_user_id,
+            assignee_username=assignee_username,
+            title=title,
+            task_date=runtime.today(),
+            created_by_user_id=int(_user(update).id),
+            now=runtime.now(),
+        )
+        created_ids.append(task_id)
+
+    existing_count = len(_numbered_user_tasks(_chat_id(update), assignee_user_id)) - len(created_ids)
+    lines = [f"已给 {assignee_name or '成员'} 创建 {len(created_ids)} 项任务："]
+    for offset, title in enumerate(task_titles, start=1):
+        lines.append(f"{existing_count + offset}. {title}")
+    await update.message.reply_text("\n".join(lines))
 
 
 async def task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -251,14 +303,14 @@ async def mytasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await _remember_user(update)
 
-    rows = runtime.repo.list_tasks_for_user(_chat_id(update), int(_user(update).id), runtime.today())
+    rows = _numbered_user_tasks(_chat_id(update), int(_user(update).id))
     if not rows:
         text = "你今天暂无任务。"
     else:
         lines = [f"我的今日任务（{runtime.today()}）"]
-        for row in rows:
+        for index, row in enumerate(rows, start=1):
             status = "已完成" if row["status"] == "done" else "进行中"
-            lines.append(f"#{row['id']} [{status}] {row['title']}")
+            lines.append(f"{index}. [{status}] {row['title']}")
         text = "\n".join(lines)
 
     if update.message:
@@ -280,10 +332,13 @@ async def tasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         text = "今天还没有分配任务。"
     else:
         lines = [f"群组今日任务（{runtime.today()}）"]
-        for row in rows:
+        per_user_counts: dict[int, int] = {}
+        for row in sorted(rows, key=lambda item: (int(item["assignee_user_id"]), int(item["id"]))):
+            user_id = int(row["assignee_user_id"])
+            per_user_counts[user_id] = per_user_counts.get(user_id, 0) + 1
             status = "已完成" if row["status"] == "done" else "进行中"
             assignee = row["full_name"] or row["assignee_username"] or row["assignee_user_id"]
-            lines.append(f"#{row['id']} [{status}] {assignee}：{row['title']}")
+            lines.append(f"{assignee} {per_user_counts[user_id]}. [{status}] {row['title']}")
         text = "\n".join(lines)
 
     if update.message:
@@ -295,13 +350,13 @@ async def _add_progress(update: Update, context: ContextTypes.DEFAULT_TYPE, text
         return
     await _remember_user(update)
 
-    task_id, note = _split_id_and_note(text)
-    if task_id is None or not note:
+    task_number, note = _split_id_and_note(text)
+    if task_number is None or not note:
         if update.message:
-            await update.message.reply_text("请这样发：进度 任务ID 进度说明")
+            await update.message.reply_text("请这样发：进度 1 进度说明")
         return
 
-    row = runtime.repo.get_task(_chat_id(update), task_id)
+    row = _resolve_user_task(_chat_id(update), int(_user(update).id), task_number)
     if not row:
         if update.message:
             await update.message.reply_text("没有找到这个任务。")
@@ -313,9 +368,9 @@ async def _add_progress(update: Update, context: ContextTypes.DEFAULT_TYPE, text
             await update.message.reply_text("只能报备自己的任务进度。")
         return
 
-    runtime.repo.add_progress(_chat_id(update), task_id, int(_user(update).id), note, runtime.now())
+    runtime.repo.add_progress(_chat_id(update), int(row["id"]), int(_user(update).id), note, runtime.now())
     if update.message:
-        await update.message.reply_text(f"已记录任务 #{task_id} 的进度。")
+        await update.message.reply_text(f"已记录任务 {task_number} 的进度。")
 
 
 async def progress(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -327,13 +382,13 @@ async def _mark_done(update: Update, context: ContextTypes.DEFAULT_TYPE, text: s
         return
     await _remember_user(update)
 
-    task_id, note = _split_id_and_note(text)
-    if task_id is None:
+    task_number, note = _split_id_and_note(text)
+    if task_number is None:
         if update.message:
-            await update.message.reply_text("请这样发：完成 任务ID")
+            await update.message.reply_text("请这样发：完成 1，或直接发 1完成.2完成")
         return
 
-    row = runtime.repo.get_task(_chat_id(update), task_id)
+    row = _resolve_user_task(_chat_id(update), int(_user(update).id), task_number)
     if not row:
         if update.message:
             await update.message.reply_text("没有找到这个任务。")
@@ -347,17 +402,49 @@ async def _mark_done(update: Update, context: ContextTypes.DEFAULT_TYPE, text: s
 
     runtime.repo.mark_done(
         _chat_id(update),
-        task_id,
+        int(row["id"]),
         int(_user(update).id),
         note or None,
         runtime.now(),
     )
     if update.message:
-        await update.message.reply_text(f"任务 #{task_id} 已标记完成。")
+        await update.message.reply_text(f"任务 {task_number} 已标记完成。")
 
 
 async def done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _mark_done(update, context, " ".join(context.args))
+
+
+async def _mark_done_numbers(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, numbers: list[int]
+) -> None:
+    if not await _require_group(update):
+        return
+    await _remember_user(update)
+
+    completed: list[int] = []
+    missing: list[int] = []
+    for number in numbers:
+        row = _resolve_user_task(_chat_id(update), int(_user(update).id), number)
+        if not row:
+            missing.append(number)
+            continue
+        runtime.repo.mark_done(
+            _chat_id(update),
+            int(row["id"]),
+            int(_user(update).id),
+            f"{number}完成",
+            runtime.now(),
+        )
+        completed.append(number)
+
+    lines: list[str] = []
+    if completed:
+        lines.append("已标记完成：" + "、".join(str(number) for number in completed))
+    if missing:
+        lines.append("没有找到任务：" + "、".join(str(number) for number in missing))
+    if update.message and lines:
+        await update.message.reply_text("\n".join(lines))
 
 
 async def report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -386,11 +473,14 @@ async def report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     lines.extend(["", "任务："])
     if task_rows:
-        for row in task_rows:
+        per_user_counts: dict[int, int] = {}
+        for row in sorted(task_rows, key=lambda item: (int(item["assignee_user_id"]), int(item["id"]))):
+            user_id = int(row["assignee_user_id"])
+            per_user_counts[user_id] = per_user_counts.get(user_id, 0) + 1
             status = "已完成" if row["status"] == "done" else "进行中"
             assignee = row["full_name"] or row["assignee_username"] or row["assignee_user_id"]
             progress_count = len(progress_map.get(int(row["id"]), []))
-            lines.append(f"#{row['id']} [{status}] {assignee}：{row['title']}（进度 {progress_count} 条）")
+            lines.append(f"{assignee} {per_user_counts[user_id]}. [{status}] {row['title']}（进度 {progress_count} 条）")
     else:
         lines.append("暂无任务")
 
@@ -404,8 +494,11 @@ async def plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     text = _clean_text(update.message.text)
     normalized = text.replace("：", ":", 1)
+    done_numbers = _parse_done_numbers(text)
 
-    if text in {"签到", "打卡"}:
+    if done_numbers:
+        await _mark_done_numbers(update, context, done_numbers)
+    elif text in {"签到", "打卡"}:
         await sign(update, context)
     elif text in {"上班", "上班打卡", "上班签到"}:
         await clock_in(update, context)
